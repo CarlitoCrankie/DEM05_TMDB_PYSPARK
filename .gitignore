@@ -1,0 +1,10 @@
+.env
+new_config.py
+venv/
+__pycache__/
+*.pyc
+data/raw/
+data/processed/
+data/analysis/
+visualizations/*.png
+.ipynb_checkpoints/

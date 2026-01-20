@@ -1,0 +1,37 @@
+services:
+  spark-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tmdb_spark
+    ports:
+      - "8888:8888"
+      - "4040:4040"
+    volumes:
+      - ./data:/app/data
+      - ./visualizations:/app/visualizations
+      - ./scripts:/app/scripts
+      - ./new_config.py:/app/new_config.py
+      - ./TMDB_EDA.ipynb:/app/TMDB_EDA.ipynb
+    environment:
+      - TMDB_API_KEY=${TMDB_API_KEY}
+      - SPARK_DRIVER_MEMORY=4g
+      - SPARK_EXECUTOR_MEMORY=4g
+    stdin_open: true
+    tty: true
+
+  pipeline:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: tmdb_pipeline
+    volumes:
+      - ./data:/app/data
+      - ./visualizations:/app/visualizations
+      - ./scripts:/app/scripts
+      - ./new_config.py:/app/new_config.py
+    environment:
+      - TMDB_API_KEY=${TMDB_API_KEY}
+    command: ["python", "scripts/pipeline.py"]
+    profiles:
+      - pipeline

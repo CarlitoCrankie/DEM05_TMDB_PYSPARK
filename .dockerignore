@@ -1,0 +1,17 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.git/
+.gitignore
+*.egg-info/
+dist/
+build/
+.env
+*.log
+data/raw/*
+data/processed/*
+data/analysis/*
+visualizations/*.png
+.ipynb_checkpoints/
