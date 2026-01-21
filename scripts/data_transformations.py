@@ -4,12 +4,17 @@ Handles all data transformation - NO API calls or analysis here
 """
 
 import logging
-from pyspark.sql import SparkSession, DataFrame
-from pyspark.sql.functions import (
-    col, when, size, array_join, to_date, expr, lit, udf
-)
-from pyspark.sql.types import StringType
 import json
+import sys
+from pathlib import Path
+from pyspark.sql import SparkSession, DataFrame
+from pyspark.sql.functions import col, when, size, array_join, to_date, expr, lit
+from pyspark.sql.types import StringType
+
+# Add parent directory to path for config import
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from new_config import CLEANING_CONFIG
 
 logger = logging.getLogger(__name__)
 
@@ -19,27 +24,22 @@ class MovieDataCleaner:
     
     def __init__(self, spark: SparkSession):
         self.spark = spark
+        self.config = CLEANING_CONFIG
         
     def load_from_json(self, movies_data: list) -> DataFrame:
-        """Convert raw API data to PySpark DataFrame using JSON string approach"""
+        """Convert raw API data to PySpark DataFrame"""
         logger.info("Creating initial DataFrame from raw data...")
         
-        # Convert to JSON strings and read back - this gives better schema inference
         json_strings = [json.dumps(movie) for movie in movies_data]
         rdd = self.spark.sparkContext.parallelize(json_strings)
         df = self.spark.read.json(rdd)
         
         logger.info(f"Initial DataFrame: {df.count()} rows × {len(df.columns)} columns")
-        
-        # Debug: Print schema
-        logger.info("Schema after loading:")
-        df.printSchema()
-        
         return df
     
     def drop_irrelevant_columns(self, df: DataFrame) -> DataFrame:
         """Step 1: Drop unnecessary columns"""
-        cols_to_drop = ['adult', 'imdb_id', 'original_title', 'video', 'homepage']
+        cols_to_drop = self.config['columns_to_drop']
         existing_cols = [c for c in cols_to_drop if c in df.columns]
         logger.info(f"Dropping {len(existing_cols)} irrelevant columns")
         return df.drop(*existing_cols)
@@ -48,11 +48,7 @@ class MovieDataCleaner:
         """Step 2: Extract and flatten nested columns"""
         logger.info("Extracting nested JSON fields...")
         
-        # Debug: Show sample before extraction
-        logger.info("Sample BEFORE extraction:")
-        df.select('title', 'genres', 'belongs_to_collection').show(2, truncate=False)
-        
-        # belongs_to_collection - it's a struct with a 'name' field
+        # belongs_to_collection - struct with 'name' field
         if 'belongs_to_collection' in df.columns:
             df = df.withColumn(
                 'collection_name',
@@ -105,9 +101,12 @@ class MovieDataCleaner:
         # cast - array of structs with 'name' field
         if 'cast' in df.columns:
             # Get cast size first
-            df = df.withColumn('cast_size', 
-                when(col('cast').isNotNull(), size(col('cast'))).otherwise(lit(0)))
+            df = df.withColumn(
+                'cast_size',
+                when(col('cast').isNotNull(), size(col('cast'))).otherwise(lit(0))
+            )
             
+            # Extract cast names
             df = df.withColumn(
                 'cast_str',
                 when(
@@ -118,9 +117,13 @@ class MovieDataCleaner:
         
         # crew - extract director and crew_size
         if 'crew' in df.columns:
-            df = df.withColumn('crew_size',
-                when(col('crew').isNotNull(), size(col('crew'))).otherwise(lit(0)))
+            # Get crew size
+            df = df.withColumn(
+                'crew_size',
+                when(col('crew').isNotNull(), size(col('crew'))).otherwise(lit(0))
+            )
             
+            # Extract director(s)
             df = df.withColumn(
                 'director',
                 when(
@@ -140,8 +143,8 @@ class MovieDataCleaner:
             ).drop('origin_country').withColumnRenamed('origin_country_str', 'origin_country')
         
         # Debug: Show sample after extraction
-        logger.info("Sample AFTER extraction:")
-        df.select('title', 'genres', 'belongs_to_collection', 'director', 'cast').show(5, truncate=50)
+        logger.info("Sample data after nested field extraction:")
+        df.select('title', 'genres', 'belongs_to_collection', 'director').show(3, truncate=50)
         
         return df
     
@@ -186,8 +189,8 @@ class MovieDataCleaner:
             when(col('vote_count') == 0, None).otherwise(col('vote_average'))
         )
         
-        # Replace placeholder text
-        placeholders = ['No Data', '', 'N/A', 'no data', 'NA']
+        # Replace placeholder text with null
+        placeholders = self.config['null_placeholders']
         df = (df
               .withColumn('overview', 
                          when(col('overview').isin(placeholders), None).otherwise(col('overview')))
@@ -211,16 +214,21 @@ class MovieDataCleaner:
         """Step 5: Remove duplicates and apply filters"""
         logger.info("Removing duplicates and filtering...")
         
+        # Remove duplicates by id
         initial_count = df.count()
         df = df.dropDuplicates(['id'])
         logger.info(f"Removed {initial_count - df.count()} duplicate rows")
         
+        # Drop rows with null id or title
         df = df.filter(col('id').isNotNull() & col('title').isNotNull())
         
+        # Filter for Released movies only
         if 'status' in df.columns:
             df = df.filter(col('status') == 'Released').drop('status')
         
-        df = self._filter_by_non_null_count(df, min_non_null=10)
+        # Keep rows with at least min_non_null_values non-null values
+        min_non_null = self.config['min_non_null_values']
+        df = self._filter_by_non_null_count(df, min_non_null)
         
         return df
     
@@ -237,15 +245,9 @@ class MovieDataCleaner:
     
     def reorder_columns(self, df: DataFrame) -> DataFrame:
         """Step 6: Reorder columns to match specification"""
-        column_order = [
-            'id', 'title', 'tagline', 'release_date', 'genres', 
-            'belongs_to_collection', 'original_language', 'budget_musd', 
-            'revenue_musd', 'production_companies', 'production_countries', 
-            'vote_count', 'vote_average', 'popularity', 'runtime', 
-            'overview', 'spoken_languages', 'poster_path', 'cast', 
-            'cast_size', 'director', 'crew_size'
-        ]
+        column_order = self.config['column_order']
         
+        # Select only existing columns in specified order
         existing_cols = [c for c in column_order if c in df.columns]
         logger.info(f"Reordering to {len(existing_cols)} final columns")
         return df.select(existing_cols)

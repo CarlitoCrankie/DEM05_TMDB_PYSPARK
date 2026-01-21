@@ -4,75 +4,104 @@ Main Pipeline Orchestrator - Coordinates all modules
 """
 
 import logging
-from pyspark.sql import SparkSession
-from pathlib import Path
-import os
 import sys
-import importlib.util
+from pathlib import Path
+from pyspark.sql import SparkSession
 
-# Import all modules (make sure they're in same directory)
+# Add parent directory to path for config import
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from new_config import (
+    TMDB_API_KEY, MOVIE_IDS, SPARK_CONFIG, PATHS, FILES,
+    LOGGING_CONFIG, CLEANING_CONFIG, ANALYSIS_CONFIG
+)
 from data_extraction import TMDBExtractor
 from data_transformations import MovieDataCleaner
 from analysis import MovieAnalyzer
 from visualizations import MovieVisualizer
 
-# Load config dynamically
-config_path = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), '..', 'new_config.py')
-)
-spec = importlib.util.spec_from_file_location("new_config", config_path)
-config = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(config)
-TMDB_API_KEY_CONFIG = config.TMDB_API_KEY
-MOVIE_IDS_CONFIG = config.MOVIE_IDS
 
-# Set Python executable for Spark on Windows
-python_exec = sys.executable
-os.environ['PYSPARK_PYTHON'] = python_exec
-os.environ['PYSPARK_DRIVER_PYTHON'] = python_exec
+def setup_logging():
+    """Configure logging based on config settings"""
+    log_dir = Path(PATHS['logs'])
+    log_dir.mkdir(parents=True, exist_ok=True)
+    
+    formatter = logging.Formatter(LOGGING_CONFIG['format'])
+    
+    root_logger = logging.getLogger()
+    root_logger.setLevel(getattr(logging, LOGGING_CONFIG['level']))
+    
+    # Clear existing handlers
+    root_logger.handlers = []
+    
+    if LOGGING_CONFIG['log_to_console']:
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setLevel(getattr(logging, LOGGING_CONFIG['level']))
+        console_handler.setFormatter(formatter)
+        root_logger.addHandler(console_handler)
+    
+    if LOGGING_CONFIG['log_to_file']:
+        log_file = Path(PATHS['logs']) / FILES['log_file']
+        file_handler = logging.FileHandler(log_file, mode='w')
+        file_handler.setLevel(getattr(logging, LOGGING_CONFIG['level']))
+        file_handler.setFormatter(formatter)
+        root_logger.addHandler(file_handler)
+    
+    return logging.getLogger(__name__)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+
+logger = setup_logging()
 
 
 class TMDBPipeline:
     
-    def __init__(self, TMDB_API_KEY: str, movie_ids: list):
+    def __init__(self):
         self.api_key = TMDB_API_KEY
-        self.movie_ids = movie_ids
+        self.movie_ids = MOVIE_IDS
         
-        # Initialize Spark with optimized configuration
+        self._validate_config()
+        self._setup_directories()
+        self._init_spark()
+        self._init_modules()
+    
+    def _validate_config(self):
+        """Validate configuration before starting"""
+        if not self.api_key or self.api_key == 'YOUR_API_KEY_HERE':
+            raise ValueError("TMDB API key not configured. Update new_config.py or set TMDB_API_KEY environment variable.")
+        
+        if not self.movie_ids:
+            raise ValueError("No movie IDs configured in new_config.py")
+        
+        logger.info("Configuration validated successfully")
+    
+    def _setup_directories(self):
+        """Create necessary directories from config"""
+        for path_name, path_value in PATHS.items():
+            Path(path_value).mkdir(parents=True, exist_ok=True)
+        logger.info("Directories created")
+    
+    def _init_spark(self):
+        """Initialize Spark session from config"""
         self.spark = SparkSession.builder \
-            .appName("TMDB Movie Analysis") \
-            .config("spark.driver.memory", os.environ.get("SPARK_DRIVER_MEMORY", "2g")) \
-            .config("spark.executor.memory", os.environ.get("SPARK_EXECUTOR_MEMORY", "2g")) \
-            .config("spark.sql.shuffle.partitions", "8") \
-            .config("spark.default.parallelism", "8") \
-            .config("spark.sql.execution.arrow.pyspark.enabled", "false") \
-            .config("spark.driver.host", "localhost") \
-            .config("spark.driver.bindAddress", "0.0.0.0") \
+            .appName(SPARK_CONFIG['app_name']) \
+            .config("spark.driver.memory", SPARK_CONFIG['driver_memory']) \
+            .config("spark.executor.memory", SPARK_CONFIG['executor_memory']) \
+            .config("spark.sql.shuffle.partitions", SPARK_CONFIG['shuffle_partitions']) \
+            .config("spark.default.parallelism", SPARK_CONFIG['default_parallelism']) \
+            .config("spark.sql.execution.arrow.pyspark.enabled", SPARK_CONFIG['arrow_enabled']) \
+            .config("spark.driver.host", SPARK_CONFIG['driver_host']) \
+            .config("spark.driver.bindAddress", SPARK_CONFIG['driver_bind_address']) \
             .getOrCreate()
-
         
         logger.info(f"Spark Session Created: {self.spark.version}")
-        
-        # Initialize all modules
+    
+    def _init_modules(self):
+        """Initialize all pipeline modules"""
         self.extractor = TMDBExtractor(self.api_key)
         self.cleaner = MovieDataCleaner(self.spark)
         self.analyzer = MovieAnalyzer()
-        self.visualizer = MovieVisualizer()
-        
-        # Setup directories
-        self.setup_directories()
-    
-    def setup_directories(self):
-        """Create necessary directories"""
-        dirs = ['data/raw', 'data/processed', 'data/analysis', 'visualizations']
-        for d in dirs:
-            Path(d).mkdir(parents=True, exist_ok=True)
+        self.visualizer = MovieVisualizer(output_dir=PATHS['visualizations'])
+        logger.info("All modules initialized")
     
     def run_extraction(self):
         """Step 1: Extract data from API"""
@@ -80,9 +109,10 @@ class TMDBPipeline:
         logger.info("STEP 1: DATA EXTRACTION FROM TMDB API")
         logger.info("="*70)
         
+        save_path = Path(PATHS['raw_data']) / FILES['raw_json']
         raw_data = self.extractor.extract_movies(
             self.movie_ids,
-            save_path='data/raw/movies_raw.json'
+            save_path=str(save_path)
         )
         
         return raw_data
@@ -95,13 +125,12 @@ class TMDBPipeline:
         
         df_clean = self.cleaner.clean_pipeline(raw_data)
         
-        # Cache for multiple operations ahead
         df_clean.cache()
         logger.info("DataFrame cached for performance optimization")
         
-        # Save to parquet (columnar format - optimized for analytics)
-        df_clean.write.mode('overwrite').parquet('data/processed/movies_clean.parquet')
-        logger.info("Cleaned data saved to Parquet format")
+        save_path = Path(PATHS['processed_data']) / FILES['clean_parquet']
+        df_clean.write.mode('overwrite').parquet(str(save_path))
+        logger.info(f"Cleaned data saved to: {save_path}")
         
         return df_clean
     
@@ -111,17 +140,14 @@ class TMDBPipeline:
         logger.info("STEP 3: KPI ANALYSIS AND CALCULATIONS")
         logger.info("="*70)
         
-        # Get all rankings
         rankings = self.analyzer.get_all_rankings(df_clean)
         
-        # Log sample results
         logger.info("\nSample Rankings:")
         logger.info("-" * 50)
         for name, df in rankings.items():
             logger.info(f"\n{name.upper()}:")
             df.show(5, truncate=False)
         
-        # Advanced searches
         searches = self.analyzer.advanced_searches(df_clean)
         logger.info("\nAdvanced Search Results:")
         logger.info("-" * 50)
@@ -129,27 +155,22 @@ class TMDBPipeline:
             logger.info(f"\n{name.upper()}:")
             df.show(truncate=False)
         
-        # Franchise analysis
         franchise_comp = self.analyzer.franchise_vs_standalone(df_clean)
         logger.info("\nFranchise vs Standalone Comparison:")
         logger.info("-" * 50)
         franchise_comp.show(truncate=False)
         
-        # Top franchises
-        top_franchises = self.analyzer.top_franchises(df_clean, top_n=10)
-        logger.info("\nTop 10 Franchises:")
+        top_franchises = self.analyzer.top_franchises(df_clean, top_n=ANALYSIS_CONFIG['top_n_results'])
+        logger.info(f"\nTop {ANALYSIS_CONFIG['top_n_results']} Franchises:")
         logger.info("-" * 50)
         top_franchises.show(truncate=False)
         
-        # Top directors
-        top_directors = self.analyzer.top_directors(df_clean, top_n=10)
-        logger.info("\nTop 10 Directors:")
+        top_directors = self.analyzer.top_directors(df_clean, top_n=ANALYSIS_CONFIG['top_n_results'])
+        logger.info(f"\nTop {ANALYSIS_CONFIG['top_n_results']} Directors:")
         logger.info("-" * 50)
         top_directors.show(truncate=False)
         
-        # Save analysis results
-        self.save_analysis_results(rankings, searches, franchise_comp, 
-                                   top_franchises, top_directors)
+        self._save_analysis_results(rankings, franchise_comp, top_franchises, top_directors)
         
         return {
             'rankings': rankings,
@@ -171,19 +192,18 @@ class TMDBPipeline:
             analysis_results['top_franchises']
         )
     
-    def save_analysis_results(self, rankings, searches, franchise_comp, 
-                             top_franchises, top_directors):
+    def _save_analysis_results(self, rankings, franchise_comp, top_franchises, top_directors):
         """Save analysis results to disk"""
         logger.info("Saving analysis results...")
         
-        # Save rankings
-        for name, df in rankings.items():
-            df.write.mode('overwrite').parquet(f'data/analysis/ranking_{name}.parquet')
+        analysis_path = Path(PATHS['analysis_data'])
         
-        # Save other analyses
-        franchise_comp.write.mode('overwrite').parquet('data/analysis/franchise_comparison.parquet')
-        top_franchises.write.mode('overwrite').parquet('data/analysis/top_franchises.parquet')
-        top_directors.write.mode('overwrite').parquet('data/analysis/top_directors.parquet')
+        for name, df in rankings.items():
+            df.write.mode('overwrite').parquet(str(analysis_path / f'ranking_{name}.parquet'))
+        
+        franchise_comp.write.mode('overwrite').parquet(str(analysis_path / 'franchise_comparison.parquet'))
+        top_franchises.write.mode('overwrite').parquet(str(analysis_path / 'top_franchises.parquet'))
+        top_directors.write.mode('overwrite').parquet(str(analysis_path / 'top_directors.parquet'))
         
         logger.info("All analysis results saved")
     
@@ -194,26 +214,20 @@ class TMDBPipeline:
             logger.info(" TMDB MOVIE ANALYSIS PIPELINE - PYSPARK IMPLEMENTATION")
             logger.info("="*70 + "\n")
             
-            # Step 1: Extract
             raw_data = self.run_extraction()
-            
-            # Step 2: Clean
             df_clean = self.run_cleaning(raw_data)
-            
-            # Step 3: Analyze
             analysis_results = self.run_analysis(df_clean)
-            
-            # Step 4: Visualize
             self.run_visualization(df_clean, analysis_results)
             
             logger.info("\n" + "="*70)
             logger.info(" PIPELINE COMPLETED SUCCESSFULLY!")
             logger.info("="*70)
             logger.info("\nOutputs:")
-            logger.info("  - Raw data: data/raw/movies_raw.json")
-            logger.info("  - Cleaned data: data/processed/movies_clean.parquet")
-            logger.info("  - Analysis results: data/analysis/")
-            logger.info("  - Visualizations: visualizations/")
+            logger.info(f"  - Raw data: {PATHS['raw_data']}/{FILES['raw_json']}")
+            logger.info(f"  - Cleaned data: {PATHS['processed_data']}/{FILES['clean_parquet']}")
+            logger.info(f"  - Analysis results: {PATHS['analysis_data']}/")
+            logger.info(f"  - Visualizations: {PATHS['visualizations']}/")
+            logger.info(f"  - Logs: {PATHS['logs']}/{FILES['log_file']}")
             logger.info("="*70 + "\n")
             
             return df_clean, analysis_results
@@ -223,22 +237,14 @@ class TMDBPipeline:
             raise
         
         finally:
-            # Clean up
             self.spark.stop()
             logger.info("Spark session stopped")
 
 
 def main():
     """Entry point for command-line execution"""
-    
-    # Configuration - Load from new_config.py
-    API_KEY = TMDB_API_KEY_CONFIG
-    MOVIE_IDS = MOVIE_IDS_CONFIG
-    
-    # Run pipeline
-    pipeline = TMDBPipeline(API_KEY, MOVIE_IDS)
+    pipeline = TMDBPipeline()
     df_clean, analysis_results = pipeline.run_full_pipeline()
-    
     return df_clean, analysis_results
 
 
