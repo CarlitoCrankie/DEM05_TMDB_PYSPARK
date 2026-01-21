@@ -1,5 +1,5 @@
 .env
-check_api_keys.py
+check_api_key.py
 venv/
 __pycache__/
 *.pyc
