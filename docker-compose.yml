@@ -11,7 +11,9 @@ services:
       - ./data:/app/data
       - ./visualizations:/app/visualizations
       - ./scripts:/app/scripts
+      - ./logs:/app/logs
       - ./new_config.py:/app/new_config.py
+      - ./.env:/app/.env
       - ./TMDB_EDA.ipynb:/app/TMDB_EDA.ipynb
     environment:
       - TMDB_API_KEY=${TMDB_API_KEY}
@@ -29,7 +31,9 @@ services:
       - ./data:/app/data
       - ./visualizations:/app/visualizations
       - ./scripts:/app/scripts
+      - ./logs:/app/logs
       - ./new_config.py:/app/new_config.py
+      - ./.env:/app/.env
     environment:
       - TMDB_API_KEY=${TMDB_API_KEY}
     command: ["python", "scripts/pipeline.py"]
