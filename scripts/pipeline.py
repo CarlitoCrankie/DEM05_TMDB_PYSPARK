@@ -83,14 +83,17 @@ class TMDBPipeline:
     def _init_spark(self):
         """Initialize Spark session from config"""
         self.spark = SparkSession.builder \
-            .appName(SPARK_CONFIG['app_name']) \
-            .config("spark.driver.memory", SPARK_CONFIG['driver_memory']) \
-            .config("spark.executor.memory", SPARK_CONFIG['executor_memory']) \
-            .config("spark.sql.shuffle.partitions", SPARK_CONFIG['shuffle_partitions']) \
-            .config("spark.default.parallelism", SPARK_CONFIG['default_parallelism']) \
-            .config("spark.sql.execution.arrow.pyspark.enabled", SPARK_CONFIG['arrow_enabled']) \
-            .config("spark.driver.host", SPARK_CONFIG['driver_host']) \
-            .config("spark.driver.bindAddress", SPARK_CONFIG['driver_bind_address']) \
+            .appName("TMDB Movie Analysis") \
+            .master("local[1]") \
+            .config("spark.driver.memory", "1g") \
+            .config("spark.executor.memory", "1g") \
+            .config("spark.sql.shuffle.partitions", "2") \
+            .config("spark.default.parallelism", "2") \
+            .config("spark.network.timeout", "600s") \
+            .config("spark.executor.heartbeatInterval", "60s") \
+            .config("spark.driver.host", "localhost") \
+            .config("spark.driver.bindAddress", "0.0.0.0") \
+            .config("spark.local.dir", "/tmp/spark") \
             .getOrCreate()
         
         logger.info(f"Spark Session Created: {self.spark.version}")
