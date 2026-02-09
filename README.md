@@ -2,7 +2,7 @@
 
 ## Executive Summary
 
-This project implements a data engineering pipeline for extracting, transforming, and analyzing movie data from The Movie Database (TMDB) API. Built with Apache Spark (PySpark) and containerized using Docker, the pipeline processes movie metadata to generate business insights and visualizations.
+This project implements a robust, production-grade data engineering pipeline for extracting, transforming, and analyzing movie data from The Movie Database (TMDB) API. Built with Apache Spark (PySpark) and containerized using Docker, the pipeline features fail-fast error handling, idempotent execution, checkpointing for fault tolerance, explicit schema validation, and atomic writes for data integrity.
 
 ## Business Objective
 
@@ -16,7 +16,19 @@ The pipeline answers key business questions about the film industry:
 
 ## Technical Architecture
 
-![System Architecture](data/System%20Architecture.png)
+![System Architecture Diagram](data/System_Architecture.png)
+
+**Architecture Overview:**
+
+The pipeline follows a modular design with clear separation of concerns:
+
+```
+API → Extraction → Transformation → Analysis → Visualization
+     (Retries)  (Validation)    (KPIs)     (Charts)
+                (Checkpoints)
+```
+
+For detailed architecture and diagrams, see [docs/project_overview.md](docs/project_overview.md) and [docs/diagrams/](docs/diagrams/)
 
 ## Technology Stack
 
@@ -56,35 +68,35 @@ TMDB_SPARK/
 
 ### Stage 1: Data Extraction
 
-- Connects to TMDB API with retry logic and rate limiting
-- Fetches movie details including cast, crew, and metadata
-- Handles API errors gracefully with configurable retries
-- Saves raw JSON for reproducibility
+- **Idempotent**: Skips extraction if valid data already exists (use `--fresh` to force re-extraction)
+- **Retry Logic**: Automatic retries for transient errors (API rate limits, network issues)
+- **Rate Limiting**: Respects TMDB API rate limits with configurable delays
+- **Atomic Writes**: Uses temp files and atomic rename for data integrity
+- **Validation**: Ensures all extracted records have required fields (id, title)
+- **Detailed Logging**: Full audit trail of extraction attempts and failures
 
 ### Stage 2: Data Transformation
 
-- Flattens nested JSON structures (genres, cast, crew, production companies)
-- Extracts director information from crew data
-- Converts budget and revenue to millions USD
-- Handles missing values and data quality issues
-- Outputs optimized Parquet format for analytics
+- **Explicit Schema**: All fields defined with proper types upfront
+- **Checkpointing**: Intermediate checkpoints for fault recovery at each transformation step
+- **Nested Field Extraction**: Flattens JSON structures (genres, cast, crew, production companies)
+- **Data Validation**: Validates schema and data quality (FAIL FAST on validation errors)
+- **Type Conversion**: Ensures proper data types (integers, doubles, dates)
+- **Null Handling**: Strategic null replacement and empty string cleanup
+- **Deduplication**: Removes duplicates and filters released movies only
 
 ### Stage 3: Analysis
 
-- Calculates derived metrics (profit, ROI)
-- Generates rankings across multiple dimensions
-- Compares franchise vs standalone performance
-- Identifies top-performing directors and franchises
-- Saves results in Parquet format for downstream use
+- **Derived Metrics**: Profit, ROI, budget breakdowns
+- **Multiple Rankings**: By revenue, rating, popularity, profit
+- **Franchise Analysis**: Compares franchise vs standalone performance
+- **Director Performance**: Identifies top-performing directors
+- **Non-Critical**: Failures don't stop pipeline, logged as warnings
 
 ### Stage 4: Visualization
 
-- Revenue vs Budget scatter plot with break-even line
-- ROI distribution histogram
-- Popularity vs Rating correlation
-- Franchise vs Standalone comparison charts
-- Top franchises by revenue and rating
-- Genre distribution analysis
+- **Non-Critical**: Generated if analysis succeeds, skipped if not
+- **Charts Generated**: Revenue vs Budget, ROI distribution, Rating-Popularity correlation, Franchise comparison, Top franchises, Genre distribution
 
 ## Key Metrics Calculated
 
@@ -101,11 +113,12 @@ TMDB_SPARK/
 
 All settings are centralized in `new_config.py`:
 
-- API credentials (loaded from .env file)
-- Spark cluster settings
-- File paths and naming conventions
-- Analysis parameters (minimum votes, budget thresholds)
-- Visualization styling
+- **API Credentials**: Loaded from `.env` file (not committed to version control)
+- **Spark Settings**: Driver/executor memory, shuffle partitions, timeouts
+- **File Paths**: Data directories, logs, visualization output
+- **Analysis Parameters**: Minimum votes, budget thresholds, top-N results
+- **Pipeline Behavior**: Logging levels, checkpoint directory, validation rules
+- **Visualization Styling**: Plot colors, figure sizes, label formatting
 
 ## Prerequisites
 
@@ -128,10 +141,16 @@ echo "TMDB_API_KEY=your_api_key_here" > .env
 docker-compose build
 ```
 
-4. Run the pipeline:
+4. Run the pipeline (idempotent mode by default):
 ```
 docker-compose up pipeline
 ```
+
+   Or run with fresh extraction:
+```
+docker-compose run --rm pipeline python scripts/pipeline.py --fresh
+```
+
 5. Run the jupyter notebook:
 ```
 docker-compose up spark-app
@@ -178,27 +197,44 @@ Access at: http://localhost:8888
 
 Spark UI available at: http://localhost:4040 (during job execution)
 
-## Logging
+## Logging & Checkpointing
 
-Pipeline execution is logged to both console and file:
-
-- Log file: `logs/pipeline.log`
+**Pipeline Logs**:
+- Log file: `logs/pipeline.log` (appended across runs for audit trail)
 - Log level: INFO (configurable)
 - Includes timestamps, module names, and execution details
+- Full stack traces for all errors
 
-## Error Handling
+**Checkpointing**:
+- Checkpoint directory: `logs/checkpoints/`
+- Automatic checkpoints at each transformation stage
+- Enables recovery from failures without re-running entire pipeline
+- Safe for re-run (idempotent design)
 
-- API failures trigger automatic retries with exponential backoff
-- Invalid movie IDs are skipped with warnings
-- Missing data fields are handled gracefully
-- All errors are logged with full stack traces
+## Error Handling & Resilience
+
+**Fail Fast Strategy**:
+- Critical failures (extraction, validation) stop pipeline immediately
+- Non-critical failures (visualization) logged as warnings, pipeline continues
+- Full stack traces to `logs/pipeline.log`
+
+**Retry Logic**:
+- API failures: Automatic retries with configurable backoff
+- Transient errors: Network timeouts, rate limits handled gracefully
+- Invalid IDs: Skipped with warnings, processing continues
+
+**Data Integrity**:
+- Atomic writes: All or nothing file operations (temp file + rename)
+- Schema validation: Explicit schema enforced on output
+- Data quality checks: Null key validation, row count verification
 
 ## Performance Considerations
 
-- Spark configured with 2GB driver and executor memory (adjustable)
-- DataFrame caching enabled for repeated operations
-- Parquet format used for efficient columnar storage
-- Shuffle partitions optimized for small datasets
+- **Spark Configuration**: 4GB driver/executor memory (adjustable in docker-compose.yml)
+- **DataFrame Caching**: In-memory caching for repeated operations
+- **Parquet Format**: Efficient columnar storage for analysis datasets
+- **Partitioning**: Shuffle partitions optimized for cluster size
+- **Checkpointing**: Staged checkpoints prevent re-computation on recovery
 
 ## Extending the Pipeline
 
@@ -213,13 +249,24 @@ MOVIE_IDS = [
 ]
 ```
 
+Pipeline will skip existing data on re-run (idempotent). Use `--fresh` flag to re-extract.
+
 ### Adding New Analysis
 
 1. Add method to `scripts/analysis.py`
 2. Call from `run_analysis()` in `scripts/pipeline.py`
 3. Save results in `_save_analysis_results()`
+4. Failures in analysis are non-critical (logged, pipeline continues)
+
+### Adding New Validations
+
+1. Add validation method to `MovieDataCleaner` class
+2. Call from `clean_pipeline()` after transformations
+3. Raise `ValidationError` to trigger FAIL FAST behavior
+4. Add recovery strategy in exception handler if needed
 
 ### Adding New Visualizations
 
 1. Add method to `scripts/visualizations.py`
 2. Call from `generate_all_visualizations()`
+3. Non-critical stage - failures logged as warnings
