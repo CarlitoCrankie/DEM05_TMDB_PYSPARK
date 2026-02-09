@@ -28,7 +28,7 @@ API → Extraction → Transformation → Analysis → Visualization
                 (Checkpoints)
 ```
 
-For detailed architecture and diagrams, see [docs/project_overview.md](docs/project_overview.md) and [docs/diagrams/](docs/diagrams/)
+For detailed architecture and diagrams [docs/diagrams/](docs/diagrams/)
 
 ## Technology Stack
 
