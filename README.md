@@ -16,15 +16,7 @@ The pipeline answers key business questions about the film industry:
 
 ## Technical Architecture
 
-```
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐     ┌─────────────────┐
-│   EXTRACTION    │────▶│ TRANSFORMATION  │────▶│    ANALYSIS     │────▶│ VISUALIZATION   │
-│   (TMDB API)    │     │   (PySpark)     │     │   (PySpark)     │     │  (Matplotlib)   │
-└─────────────────┘     └─────────────────┘     └─────────────────┘     └─────────────────┘
-        │                       │                       │                       │
-        ▼                       ▼                       ▼                       ▼
-   movies_raw.json      movies_clean.parquet    analysis/*.parquet    visualizations/*.png
-```
+![System Architecture](data/System%20Architecture.png)
 
 ## Technology Stack
 
@@ -140,8 +132,11 @@ docker-compose build
 ```
 docker-compose up pipeline
 ```
-
-5. View outputs:
+5. Run the jupyter notebook:
+```
+docker-compose up spark-app
+```
+6. View outputs:
 ```
 ls -la data/analysis/
 ls -la visualizations/

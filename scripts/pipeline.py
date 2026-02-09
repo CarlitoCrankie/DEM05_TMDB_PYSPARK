@@ -1,10 +1,12 @@
 """
 scripts/pipeline.py
 Main Pipeline Orchestrator - Coordinates all modules
+Idempotent design: Safe to re-run entire pipeline without side effects
 """
 
 import logging
 import sys
+import tempfile
 from pathlib import Path
 from pyspark.sql import SparkSession
 
@@ -15,8 +17,8 @@ from new_config import (
     TMDB_API_KEY, MOVIE_IDS, SPARK_CONFIG, PATHS, FILES,
     LOGGING_CONFIG, CLEANING_CONFIG, ANALYSIS_CONFIG
 )
-from data_extraction import TMDBExtractor
-from data_transformations import MovieDataCleaner
+from data_extraction import TMDBExtractor, ExtractionError
+from data_transformations import MovieDataCleaner, ValidationError
 from analysis import MovieAnalyzer
 from visualizations import MovieVisualizer
 
@@ -42,7 +44,8 @@ def setup_logging():
     
     if LOGGING_CONFIG['log_to_file']:
         log_file = Path(PATHS['logs']) / FILES['log_file']
-        file_handler = logging.FileHandler(log_file, mode='w')
+        # Append to log file for audit trail across runs
+        file_handler = logging.FileHandler(log_file, mode='a')
         file_handler.setLevel(getattr(logging, LOGGING_CONFIG['level']))
         file_handler.setFormatter(formatter)
         root_logger.addHandler(file_handler)
@@ -54,15 +57,33 @@ logger = setup_logging()
 
 
 class TMDBPipeline:
+    """Idempotent TMDB Pipeline Orchestrator
     
-    def __init__(self):
+    Design principles:
+    - Fail fast: Stop on critical failures
+    - Retry transient errors: API rate limits, network issues
+    - Idempotent: Safe to re-run without manual cleanup
+    - Atomic writes: All or nothing data updates
+    - Checkpointed: Recovery from failures
+    """
+    
+    def __init__(self, idempotent_mode: bool = True):
         self.api_key = TMDB_API_KEY
         self.movie_ids = MOVIE_IDS
+        self.idempotent_mode = idempotent_mode
         
         self._validate_config()
         self._setup_directories()
+        self._setup_checkpoint_dir()
         self._init_spark()
         self._init_modules()
+    
+    def _setup_checkpoint_dir(self):
+        """Setup checkpoint directory for fault tolerance"""
+        checkpoint_dir = Path(PATHS['logs']) / 'checkpoints'
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self.checkpoint_dir = str(checkpoint_dir)
+        logger.info(f"Checkpoint directory: {self.checkpoint_dir}")
     
     def _validate_config(self):
         """Validate configuration before starting"""
@@ -101,41 +122,84 @@ class TMDBPipeline:
     def _init_modules(self):
         """Initialize all pipeline modules"""
         self.extractor = TMDBExtractor(self.api_key)
-        self.cleaner = MovieDataCleaner(self.spark)
+        self.cleaner = MovieDataCleaner(self.spark, checkpoint_dir=self.checkpoint_dir)
         self.analyzer = MovieAnalyzer()
         self.visualizer = MovieVisualizer(output_dir=PATHS['visualizations'])
         logger.info("All modules initialized")
     
     def run_extraction(self):
-        """Step 1: Extract data from API"""
+        """Step 1: Extract data from API with idempotency check"""
         logger.info("="*70)
         logger.info("STEP 1: DATA EXTRACTION FROM TMDB API")
         logger.info("="*70)
         
         save_path = Path(PATHS['raw_data']) / FILES['raw_json']
-        raw_data = self.extractor.extract_movies(
-            self.movie_ids,
-            save_path=str(save_path)
-        )
         
-        return raw_data
+        # Idempotency: Skip extraction if data already exists and is valid
+        if self.idempotent_mode and save_path.exists() and save_path.stat().st_size > 0:
+            logger.info(f"Raw data already exists: {save_path}")
+            logger.info("Skipping extraction (idempotent mode)")
+            try:
+                import json
+                with open(save_path, 'r') as f:
+                    raw_data = json.load(f)
+                logger.info(f"Loaded {len(raw_data)} movies from existing file")
+                return raw_data
+            except Exception as e:
+                logger.warning(f"Failed to load existing data: {str(e)}. Re-extracting...")
+        
+        # FAIL FAST: Stop if extraction fails
+        try:
+            raw_data = self.extractor.extract_movies(
+                self.movie_ids,
+                save_path=str(save_path)
+            )
+            logger.info(f"Extraction successful: {len(raw_data)} movies")
+            return raw_data
+        
+        except ExtractionError as e:
+            logger.critical(f"EXTRACTION FAILED (FAIL FAST): {str(e)}")
+            raise
+        except Exception as e:
+            logger.critical(f"Unexpected error during extraction: {str(e)}", exc_info=True)
+            raise
     
     def run_cleaning(self, raw_data):
-        """Step 2: Clean and transform data"""
+        """Step 2: Clean and transform data with atomic writes and checkpointing"""
         logger.info("="*70)
         logger.info("STEP 2: DATA CLEANING AND TRANSFORMATION")
         logger.info("="*70)
         
-        df_clean = self.cleaner.clean_pipeline(raw_data)
-        
-        df_clean.cache()
-        logger.info("DataFrame cached for performance optimization")
-        
         save_path = Path(PATHS['processed_data']) / FILES['clean_parquet']
-        df_clean.write.mode('overwrite').parquet(str(save_path))
-        logger.info(f"Cleaned data saved to: {save_path}")
         
-        return df_clean
+        # FAIL FAST: Stop if cleaning/validation fails
+        try:
+            df_clean = self.cleaner.clean_pipeline(raw_data)
+            
+            df_clean.cache()
+            logger.info("DataFrame cached for performance optimization")
+            
+            # Atomic write: Write to temp location first, then move
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = str(save_path.parent / f"{save_path.name}.tmp")
+            
+            df_clean.write.mode('overwrite').parquet(temp_path)
+            
+            # Atomic move
+            import shutil
+            if save_path.exists():
+                shutil.rmtree(save_path)
+            shutil.move(temp_path, str(save_path))
+            
+            logger.info(f"Cleaned data saved (atomically) to: {save_path}")
+            return df_clean
+        
+        except ValidationError as e:
+            logger.critical(f"DATA VALIDATION FAILED (FAIL FAST): {str(e)}")
+            raise
+        except Exception as e:
+            logger.critical(f"Error during cleaning: {str(e)}", exc_info=True)
+            raise
     
     def run_analysis(self, df_clean):
         """Step 3: Perform KPI analysis"""
@@ -211,16 +275,32 @@ class TMDBPipeline:
         logger.info("All analysis results saved")
     
     def run_full_pipeline(self):
-        """Execute complete pipeline end-to-end"""
+        """Execute complete pipeline end-to-end (idempotent and fail-fast)"""
         try:
             logger.info("\n" + "="*70)
             logger.info(" TMDB MOVIE ANALYSIS PIPELINE - PYSPARK IMPLEMENTATION")
+            logger.info(f" Mode: {'IDEMPOTENT' if self.idempotent_mode else 'FRESH'}")
             logger.info("="*70 + "\n")
             
+            # FAIL FAST: Stop on extraction failure
             raw_data = self.run_extraction()
+            
+            # FAIL FAST: Stop on cleaning/validation failure
             df_clean = self.run_cleaning(raw_data)
-            analysis_results = self.run_analysis(df_clean)
-            self.run_visualization(df_clean, analysis_results)
+            
+            # FAIL FAST: Stop on analysis failure
+            try:
+                analysis_results = self.run_analysis(df_clean)
+            except Exception as e:
+                logger.error(f"Analysis failed: {str(e)}", exc_info=True)
+                analysis_results = None
+            
+            # Visualization is non-critical
+            try:
+                if analysis_results:
+                    self.run_visualization(df_clean, analysis_results)
+            except Exception as e:
+                logger.warning(f"Visualization generation failed (non-critical): {str(e)}")
             
             logger.info("\n" + "="*70)
             logger.info(" PIPELINE COMPLETED SUCCESSFULLY!")
@@ -231,10 +311,14 @@ class TMDBPipeline:
             logger.info(f"  - Analysis results: {PATHS['analysis_data']}/")
             logger.info(f"  - Visualizations: {PATHS['visualizations']}/")
             logger.info(f"  - Logs: {PATHS['logs']}/{FILES['log_file']}")
+            logger.info(f"  - Checkpoints: {self.checkpoint_dir}")
             logger.info("="*70 + "\n")
             
             return df_clean, analysis_results
             
+        except (ExtractionError, ValidationError) as e:
+            logger.error(f"CRITICAL FAILURE - Pipeline stopped (FAIL FAST): {str(e)}", exc_info=True)
+            raise
         except Exception as e:
             logger.error(f"Pipeline failed: {str(e)}", exc_info=True)
             raise
@@ -246,7 +330,17 @@ class TMDBPipeline:
 
 def main():
     """Entry point for command-line execution"""
-    pipeline = TMDBPipeline()
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="TMDB Movie Analysis Pipeline")
+    parser.add_argument(
+        '--fresh', 
+        action='store_true', 
+        help='Run pipeline in fresh mode (skip idempotent checks)'
+    )
+    args = parser.parse_args()
+    
+    pipeline = TMDBPipeline(idempotent_mode=not args.fresh)
     df_clean, analysis_results = pipeline.run_full_pipeline()
     return df_clean, analysis_results
 

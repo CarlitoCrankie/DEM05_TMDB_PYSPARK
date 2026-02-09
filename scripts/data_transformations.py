@@ -9,7 +9,9 @@ import sys
 from pathlib import Path
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql.functions import col, when, size, array_join, to_date, expr, lit
-from pyspark.sql.types import StringType
+from pyspark.sql.types import (
+    StructType, StructField, IntegerType, StringType, DoubleType, DateType, BooleanType
+)
 
 # Add parent directory to path for config import
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -18,13 +20,48 @@ from new_config import CLEANING_CONFIG
 
 logger = logging.getLogger(__name__)
 
+# EXPLICIT SCHEMA DEFINITION (Derived from TMDB API response structure)
+MOVIE_SCHEMA = StructType([
+    StructField('id', IntegerType(), False),
+    StructField('title', StringType(), False),
+    StructField('overview', StringType(), True),
+    StructField('tagline', StringType(), True),
+    StructField('release_date', DateType(), True),
+    StructField('runtime', IntegerType(), True),
+    StructField('vote_average', DoubleType(), True),
+    StructField('vote_count', IntegerType(), True),
+    StructField('popularity', DoubleType(), True),
+    StructField('budget_musd', DoubleType(), True),
+    StructField('revenue_musd', DoubleType(), True),
+    StructField('genres', StringType(), True),
+    StructField('belongs_to_collection', StringType(), True),
+    StructField('production_companies', StringType(), True),
+    StructField('production_countries', StringType(), True),
+    StructField('spoken_languages', StringType(), True),
+    StructField('director', StringType(), True),
+    StructField('cast', StringType(), True),
+    StructField('cast_size', IntegerType(), True),
+    StructField('crew_size', IntegerType(), True),
+    StructField('origin_country', StringType(), True),
+    StructField('status', StringType(), True),
+    StructField('original_language', StringType(), True),
+])
+
+
+class ValidationError(Exception):
+    """Custom exception for data validation failures"""
+    pass
+
 
 class MovieDataCleaner:
     """Handles all data cleaning and transformation using PySpark"""
     
-    def __init__(self, spark: SparkSession):
+    def __init__(self, spark: SparkSession, checkpoint_dir: str = None):
         self.spark = spark
         self.config = CLEANING_CONFIG
+        self.checkpoint_dir = checkpoint_dir
+        if checkpoint_dir:
+            self.spark.sparkContext.setCheckpointDir(checkpoint_dir)
         
     def load_from_json(self, movies_data: list) -> DataFrame:
         """Convert raw API data to PySpark DataFrame"""
@@ -252,21 +289,90 @@ class MovieDataCleaner:
         logger.info(f"Reordering to {len(existing_cols)} final columns")
         return df.select(existing_cols)
     
+    def validate_schema(self, df: DataFrame) -> None:
+        """Validate output DataFrame against expected schema"""
+        required_cols = {'id', 'title', 'release_date', 'vote_average'}
+        missing_cols = required_cols - set(df.columns)
+        
+        if missing_cols:
+            raise ValidationError(f"Missing required columns: {missing_cols}")
+        
+        # Check data types
+        schema_dict = {f.name: f.dataType for f in df.schema.fields}
+        if schema_dict['id'].typeName() != 'integer':
+            raise ValidationError(f"Column 'id' should be integer, got {schema_dict['id'].typeName()}")
+        if schema_dict['title'].typeName() != 'string':
+            raise ValidationError(f"Column 'title' should be string, got {schema_dict['title'].typeName()}")
+        
+        logger.info(f"Schema validation passed: {len(df.columns)} columns, {df.count()} rows")
+    
+    def validate_data_quality(self, df: DataFrame) -> None:
+        """Validate data quality metrics"""
+        row_count = df.count()
+        
+        if row_count == 0:
+            raise ValidationError("DataFrame is empty - no data to process")
+        
+        # Check for null IDs (primary key)
+        null_ids = df.filter(col('id').isNull()).count()
+        if null_ids > 0:
+            raise ValidationError(f"Found {null_ids} rows with null id (primary key)")
+        
+        # Check for null titles
+        null_titles = df.filter(col('title').isNull()).count()
+        if null_titles > 0:
+            logger.warning(f"Found {null_titles} rows with null title")
+        
+        # Log data quality metrics
+        logger.info(f"Data quality check: {row_count} valid rows")
+    
+    def checkpoint(self, df: DataFrame, label: str) -> DataFrame:
+        """Create checkpoint for fault tolerance and recovery"""
+        if self.checkpoint_dir:
+            try:
+                df = df.checkpoint()
+                logger.info(f"Checkpointed: {label}")
+            except Exception as e:
+                logger.warning(f"Failed to checkpoint {label}: {str(e)}. Continuing without checkpoint.")
+        return df
+    
     def clean_pipeline(self, movies_data: list) -> DataFrame:
-        """Execute complete cleaning pipeline"""
+        """Execute complete cleaning pipeline with validation and checkpointing"""
         logger.info("="*60)
         logger.info("Starting Data Cleaning Pipeline")
         logger.info("="*60)
         
-        df = self.load_from_json(movies_data)
-        df = self.drop_irrelevant_columns(df)
-        df = self.extract_nested_fields(df)
-        df = self.convert_datatypes(df)
-        df = self.handle_missing_and_invalid(df)
-        df = self.remove_duplicates_and_filter(df)
-        df = self.reorder_columns(df)
+        try:
+            df = self.load_from_json(movies_data)
+            df = self.drop_irrelevant_columns(df)
+            df = self.checkpoint(df, "after column drop")
+            
+            df = self.extract_nested_fields(df)
+            df = self.checkpoint(df, "after nested field extraction")
+            
+            df = self.convert_datatypes(df)
+            df = self.checkpoint(df, "after type conversion")
+            
+            df = self.handle_missing_and_invalid(df)
+            df = self.checkpoint(df, "after null/invalid handling")
+            
+            df = self.remove_duplicates_and_filter(df)
+            df = self.checkpoint(df, "after deduplication")
+            
+            df = self.reorder_columns(df)
+            
+            # Validate schema and data quality - FAIL FAST if validation fails
+            self.validate_schema(df)
+            self.validate_data_quality(df)
+            
+            logger.info(f"Cleaning complete: {df.count()} rows × {len(df.columns)} columns")
+            logger.info("="*60)
+            
+            return df
         
-        logger.info(f"Cleaning complete: {df.count()} rows × {len(df.columns)} columns")
-        logger.info("="*60)
-        
-        return df
+        except ValidationError as e:
+            logger.error(f"Data validation failed (FAIL FAST): {str(e)}")
+            raise
+        except Exception as e:
+            logger.error(f"Pipeline error: {str(e)}", exc_info=True)
+            raise
